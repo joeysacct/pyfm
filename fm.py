@@ -1,167 +1,265 @@
 import curses
-import subprocess
-import numpy as np
 import time
 from pathlib import Path
+from classes import FileItem, Directory
+from render import render_file_columns
+from file_ops import copy_files, rename_file, move_files, delete_files
 
-
-class FileItem:
-    def __init__(self, ls_entry):
-        rwx_props,_,owner,group,size,month,day,timestamp,filename = ls_entry.split()
-        self.rwx_props = rwx_props
-        self.filename = filename
-        self.name = filename # TODO add formatting here?
-        self.timestamp = month + day + timestamp
-        self.size = size
-        if rwx_props.startswith("d"):
-            self.type = "dir"
-        elif rwx_props.startswith("l"):
-            self.type = "link"
-        elif rwx_props.startswith("-"):
-            self.type = "file"
-        else:
-            self.type = "unhandled"
-
-
-    def file_preview(self):
-        filetype = self.name.split(".")[-1] or "unknown"
-        try:
-            path.read_text(encoding="utf-8")
-            # cat out text file data
-            return subprocess.run(["head", "-10", self.name], capture_output=True)
-        except (UnicodeDecodeError, OSError):
-            return f"{filetype} file"
-            
-
-
-class MenuData:
-    def __init__(self, current_dir):
-        self.num_files = 0 # number of entries in working dir
-        self.working_dir_data = []
-        self.parent_dir_data = []
-        self.preview = []
-        self.change_dir(current_dir)
-
-
-    def change_dir(self, new_dir):
-        self.working_dir_data = self.dir_data(new_dir)
-        self.num_files = len(self.working_dir_data)
-        self.parent_dir_data = self.dir_data(new_dir.parent)
-        self.update_preview(0) # start at first item
-
-    
-    def update_preview(self, item_idx):
-        child_item = self.working_dir_data[item_idx]
-        item_type = child_item.type
-        if item_type == "dir":
-            dir_info = dir_data(new_dir / child_item.name)
-            self.preview = "\n".join([item.name for item in dir_info])
-        elif item_type == "file":
-            self.preview = child_item.file_preview()
-        else:
-            self.preview = []
-
-
-    def dir_data(self, dir_name):
-        ls_data = subprocess.run(["ls", "-lh", dir_name], capture_output=True).stdout.decode('utf-8')
-        entries = []
-
-        # raise ValueError(ls_data)
-        for entry in ls_data.split("\n"):
-            if entry.startswith("total"):
-                continue
-            entries.append(FileItem(entry))
-            
-        if len(entries) > 0:
-            return entries
-        return [FileItem("--------- 0 none none 0.0B Jan 1 00:00 Empty")]
-            
         
-
+def get_debounced_key(stdcsr):
+    key = curses.ERR
+    while True:
+        k = stdcsr.getch()
+        if k == curses.ERR:
+            break
+        key = k
+    return key
 
 
 def run_fm(stdcsr):
-    working_dir = Path("/home/joeysacct") # TODO make working dir
-    current_dir = working_dir
+    initial_path = Path("/home/joeysacct") # TODO make working dir
 
-    framerate = 20.0
-    menu_data = MenuData(current_dir)
+    framerate = 60.0
+
+    parent_dir = Directory(initial_path.parent)
+    current_dir = Directory(initial_path)
+    current_dir.get_children()
+    current_items = current_dir.child_names
+    hovered_item = current_dir.children[0]
 
     cursor_idx = 0
-    selected_indices = []
+    selected_file = 0
+    selected_indices = set()
+    grabbed_files = []
+
     while True:
         # render file colums
-        render_file_columns(menu_data, stdcsr)
 
         # handle input
-        scroll_modulus = max(menu_data.num_files,1)
-        key = stdcsr.getch()
+        key = get_debounced_key(stdcsr)
 
         if key == ord("q"):
             break
+
         elif key == curses.KEY_UP: # idx up 1
             cursor_idx -= 1
-            cursor_idx %= scroll_modulus
-            menu_data.update_preview(cursor_idx)
+            cursor_idx %= current_dir.num_files
+
         elif key == curses.KEY_DOWN: # idx down 1
             cursor_idx += 1
-            cursor_idx %= scroll_modulus
-            menu_data.update_preview(cursor_idx)
+            cursor_idx %= current_dir.num_files
+
         elif key == curses.KEY_LEFT: # change working directory to parent dir
-            menu_data.change_dir(current_dir.parent)
+            if len(current_dir.name) > 0:
+                selected_indices = set()
+                stdcsr.clear()
+                cursor_idx = parent_dir.idx_of_entry(current_dir.name)
+                current_dir = Directory(current_dir.path.parent)
+                current_dir.get_children()
+                parent_dir = Directory(current_dir.path.parent)
+
         elif key == curses.KEY_RIGHT: # change working directory to selected dir, or open file with vim
-            new_dir_name = menu_data.working_dir_data[cursor_idx].name
-            menu_data.change_dir(current_dir / new_dir_name)
+            if len(str(hovered_item.path)) > 0 and hovered_item.path.is_dir():
+                selected_indices = set()
+                stdcsr.clear()
+                parent_dir = current_dir
+                current_dir = Directory(current_dir.path / hovered_item.name)
+                current_dir.get_children()
+                cursor_idx = 0
+            # TODO add file opening support 
 
         elif key == ord("s"): # select
             # select/deselect file/dir in current dir
-            print("")
+            if cursor_idx in selected_indices:
+                selected_indices.remove(cursor_idx)
+            else:
+                selected_indices.add(cursor_idx)
+                
         elif key == ord("a"): # select all
             # select/deselect all files/dirs in current dir
-            print("")
+            if len(selected_indices) == current_dir.num_files:
+                selected_indices = set()
+            else:
+                selected_indices = set(range(current_dir.num_files))
+
+        elif key == ord("g"): # grab selected
+            if len(selected_indices) == 0:
+                grabbed_files = [hovered_item]
+            else:
+                grabbed_files = [current_dir.children[i] for i in selected_indices]
+
+        elif key == ord("r"): # rename
+            do_rename(stdcsr, hovered_item)
         elif key == ord("d"): # delete
-            # give yes/no prompt to delete flie
-            print("")
+            # give yes/no prompt to delete files
+            if len(selected_indices) > 0:
+                do_delete(stdcsr, [current_dir.children[i] for i in selected_indices])
+            else:
+                do_delete(stdcsr, [hovered_item])
+            selected_indices = set()
         elif key == ord("m"): # move
-            # give prompt for directory to move the file to, then cut+paste it there
-            print("")
-        elif key == ord("x"): # cut
-            # cut file
-            print("")
-        elif key == ord("c"): # copy
-            # copy file
-            print("")
-        elif key == ord("p"): # paste
-            # paste file
-            print("")
+            if len(grabbed_files) > 0:
+                do_move(stdcsr, grabbed_files, current_dir, copy=False)
+            grabbed_files = []
+        elif key == ord("c"):
+            if len(grabbed_files) > 0:
+                do_move(stdcsr, grabbed_files, current_dir, copy=True)
+
+        if key in map(ord,"rdmc"):
+            stdcsr.clear()
+            current_dir.refresh_ls()
+            current_dir.get_children()
+            cursor_idx = 0
+
+        if key is not None: # rerender 
+            hovered_item = current_dir.children[cursor_idx]
+            render_file_columns(parent_dir, current_dir, stdcsr, hovered_item, cursor_idx, selected_indices, grabbed_files)
 
         time.sleep(1/framerate)
 
 
-def render_file_columns(menu_data, stdcsr):
-    width, height = stdcsr.getmaxyx()
 
-    col_locations = np.round(width*np.array([0.125, 0.625])).astype(int)
+def do_rename(stdcsr, hovered_item):
+    height, width = stdcsr.getmaxyx()
+    y,x = (height - 1),0
+    
+    prompt = curses.newwin(1,width-2,y,x)
+    prompt.keypad(True)
+    
+    msg = "Rename file to: "
+    prompt.addstr(0,0,msg)
+    prompt.refresh()
 
-    # place bars
-    for h in range(height):
-        for w in col_locations:
-            try:
-                stdcsr.addstr(h,w,"|")
-            except:
-                pass
+    file_to_rename = hovered_item
+    buf = str(hovered_item.path)
+    curses.curs_set(1)
+    while True:
+        prompt.addstr(0,len(msg)+1, " "*(len(buf)+1))
+        prompt.addstr(0,len(msg)+1, buf[-width - len(msg) - 1:])
 
-    # place parent dir view
-    for h,fileitem in enumerate(menu_data.parent_dir_data):
-        stdcsr.addstr(h,0,fileitem.name)
+        key = prompt.get_wch()
+        if key == "\x1b":
+            curses.curs_set(0)
+            break
+        elif key in ("\n", "\r"):
+            curses.curs_set(0)
+            # handle file rename
+            rename_file(hovered_item.path, buf)
 
-    # place current dir view
-    w = col_locations[0] + 1
-    for h,fileitem in enumerate(menu_data.working_dir_data):
-        stdcsr.addstr(h,w,fileitem.name)
+            prompt.addstr(0,len(msg)+1, " "*(len(buf)+1))
+            prompt.addstr(0,0,f"File renamed to {buf}")
+            prompt.refresh()
+            time.sleep(1)
+            break
+        elif key in ("\b", "\x7f", curses.KEY_BACKSPACE):
+            buf = buf[:-1]
+        elif isinstance(key, str) and key.isprintable():
+            buf += key
 
-    # place preview
-    w = col_locations[1] + 1
-    for line in menu_data.preview:
-        stdcsr.addstr(0,w,line)
 
+def do_delete(stdcsr, items):
+    height, width = stdcsr.getmaxyx()
+
+    if len(items) < 4:
+        filenames = ", ".join([i.name for i in items])
+    else:
+        filenames = f"{len(items)} files"
+    msg = "Delete " + filenames +"? (y/n)"
+    
+    y,x = (height - 1),0
+    
+    prompt = curses.newwin(1,width-2,y,x)
+    prompt.keypad(True)
+    
+
+    prompt.addstr(0,0,msg)
+    prompt.refresh()
+
+    buf = ""
+    curses.curs_set(1)
+    while True:
+        prompt.addstr(0,len(msg)+1, " "*(len(buf)+1))
+        prompt.addstr(0,len(msg)+1, buf[-width - len(msg) - 1:])
+
+        key = prompt.get_wch()
+        if key == "\x1b":
+            curses.curs_set(0)
+            break
+        elif key in ("\n", "\r"):
+            if buf.lower() in ["y", "yes"]:
+                # handle file delete
+
+                delete_files(items)
+                
+                # output msg
+                prompt.addstr(0,0, " "*(len(buf)+len(msg)+1))
+                prompt.addstr(0,0,f"File(s) deleted.")
+                prompt.refresh()
+                time.sleep(1)
+                curses.curs_set(0)
+                break
+            elif buf.lower() in ["n", "no"]:
+                curses.curs_set(0)
+                break
+            else:
+                buf = ""
+        elif key in ("\b", "\x7f", curses.KEY_BACKSPACE):
+            buf = buf[:-1]
+        elif isinstance(key, str) and key.isprintable():
+            buf += key
+
+
+
+def do_move(stdcsr, items, current_dir, copy=True):
+    height, width = stdcsr.getmaxyx()
+
+    filenames = ", ".join([i.name for i in items])
+    if len(filenames) > width - 5 - 30:
+        filenames = f"{len(items)} files"
+
+    action = "copy " if copy else "move "
+    msg = action + filenames + " to this directory? (y/n)"
+    
+    y,x = (height - 1),0
+    
+    prompt = curses.newwin(1,width-2,y,x)
+    prompt.keypad(True)
+    
+
+    prompt.addstr(0,0,msg)
+    prompt.refresh()
+
+    buf = ""
+    curses.curs_set(1)
+    while True:
+        prompt.addstr(0,len(msg)+1, " "*(len(buf)+1))
+        prompt.addstr(0,len(msg)+1, buf[-width - len(msg) - 1:])
+
+        key = prompt.get_wch()
+        if key == "\x1b":
+            curses.curs_set(0)
+            break
+        elif key in ("\n", "\r"):
+            if buf.lower() in ["y", "yes"]:
+
+                if copy:
+                    copy_files(items, current_dir.path)
+                else:
+                    move_files(items, current_dir.path)
+                
+                # output msg
+                prompt.addstr(0,0, " "*(len(buf)+len(msg)+1))
+                prompt.addstr(0,0,f"File(s) {'copied' if copy else 'moved'}.")
+                prompt.refresh()
+                time.sleep(1)
+                curses.curs_set(0)
+                break
+            elif buf.lower() in ["n", "no"]:
+                curses.curs_set(0)
+                break
+            else:
+                buf = ""
+        elif key in ("\b", "\x7f", curses.KEY_BACKSPACE):
+            buf = buf[:-1]
+        elif isinstance(key, str) and key.isprintable():
+            buf += key
