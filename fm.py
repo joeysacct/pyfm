@@ -109,6 +109,7 @@ def run_fm(stdcsr):
             stdcsr.clear()
             current_dir.refresh_ls()
             current_dir.get_children()
+            grabbed_files = []
             cursor_idx = 0
 
         if key is not None: # rerender 
